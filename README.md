@@ -9,6 +9,7 @@ Features:
 
 * Incremental file transfer using rsync's rolling window sync algorithm.
 * Matching files based on size-and-mtime or checksums.
+* Chunking for both incremental and non-incremental transfers - ensures bounded memory usage on receiving end.
 * Each of the two scripts is ~200 lines of code, using only modules from the Python standard library.
 * Usage on iOS via [Pyto](https://apps.apple.com/us/app/pyto-python-3/id1436650069).
 
@@ -60,20 +61,28 @@ Options:
 Rationale
 ---------
 
-I have around 60GB of music and books on my Linux computer, and I want all of it synced to my iPhone for offline consumption. To do this, I've previously used:
+I have around 60GB of music and books on my computer, and I want all of it synced to my iPhone for offline consumption. My requirements are:
 
-* USB file transfer: occasionally worked in the past, except it would break regularly on most iOS or `libimobiledevice` updates. Also, has no sync functionality.
-* [OpenDrop](https://github.com/seemoo-lab/opendrop) (an implementation of Apple's AirDrop): stopped working with iPhones approximately after iOS 15 was released. Also, has no sync functionality.
-* WiFi-based file transfer via [LanDrop](https://landrop.app/): can't sync files in other apps' iOS filesystem containers - I'd have to re-transfer the entire collection over each time to make sure the other apps had the latest versions of all the files.
-* [Dropbox](https://dropbox.com/): same problem as LanDrop, but also dependent on third-party cloud services.
-* [Google Drive](https://drive.google.com/): same problem as LanDrop, but also dependent on third-party cloud services.
-* Mobius Sync (an iOS client for the Syncthing protocol): same problem as LanDrop.
-* Acrosync (an iOS port of rsync): same problem as LanDrop, but also the app hasn't been updated in 7 years and so will likely stop working in a future iOS update.
-* Rsync running inside Alpine Linux running inside [iSH](https://ish.app/): almost perfect, but for larger transfers, iSH would run out of memory and freeze.
+* Linux/iOS support: must work with modern  and not require any.
+* Sync support: must be able to create, update, and delete files on the iPhone until it matches what's on the computer.
+* Filesystem containers support: must be able to sync files directly into apps such as VLC and Kiwix. This is because there may only be room for one copy on the phone. Also, it's inconvenient to have to manually move all of those files to the right apps' filesystem containers in order to actually use them.
+* Large files support: must be able to handle 60 GB+ files within a reasonable time and without failing. Incremental sync would also be useful here in case the operation gets interrupted and resumed.
+* Trustworthy: either completely open source or built by a well-known developer with a good track record, and no dependency on third-party services.
+
+| Approach                                           | Linux/iOS? | Sync? | Filesystem containers? | Large files? | Trustworthy? | Notes |
+|:---------------------------------------------------|:-----------|:------|:-----------------------|:-------------|:-------------|:------|
+| USB file transfer                                  | No         | No    | No                     | Yes          | Yes          | Breaks regularly on most iOS or `libimobiledevice` updates |
+| [OpenDrop](https://github.com/seemoo-lab/opendrop) | Sort of    | No    | No                     | Yes          | Yes          | Reverse-engineered AirDrop, stopped working with iPhones after iOS 15 |
+| [LanDrop](https://landrop.app/)                    | Yes        | No    | No                     | Yes          | Yes          | Nice UI and cross-platform |
+| [Dropbox](https://dropbox.com/)                    | Yes        | Yes   | No                     | No           | No           | - |
+| [Google Drive](https://drive.google.com/)          | Yes        | Yes   | No                     | No           | No           | - |
+| Mobius Sync                                        | Yes        | Yes   | No                     | Yes          | Yes          | This app is the closest thing to an iOS SyncThing port |
+| Acrosync                                           | Yes        | Yes   | No                     | Yes          | Sort of      | App seems unmaintained, will likely stop working in a future iOS update |
+| Rsync on [iSH](https://ish.app/)                   | Yes        | Yes   | Yes                    | No           | Yes          | For larger transfers, app runs out of memory and freezes |
 
 Finally, I decided to write my own rsync-like client and server, using the same rolling window sync algorithm and a simple directory sync protocol on top of HTTP. It's much simpler to understand and use, but doesn't support any features unnecessary for my use case, such as syncing symlinks, permissions, owners, and groups.
 
-I start the Femtosync server in the Pyto app on the iPhone, start the Femtosync client on the Linux computer, and the files are quickly transferred into the filesystem containers of the iOS apps that they're destined for. The [iOS Shortcuts app](https://support.apple.com/en-ca/guide/shortcuts/welcome/ios) can automate the process of starting the Femtosync server on the iOS side, while a shell script automates the process of starting the Femtosync client on the Linux side.
+I start the Femtosync server in the Pyto app on the iPhone, start the Femtosync client on the Linux computer, and the files are quickly transferred into the filesystem containers of the iOS apps that they're destined for. The [iOS Shortcuts app](https://support.apple.com/en-ca/guide/shortcuts/welcome/ios) can make this a single-tap operation on the iPhone side.
 
 License
 -------
