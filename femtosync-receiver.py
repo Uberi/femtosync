@@ -23,7 +23,7 @@ else:
 
 SERVER_HOST = "0.0.0.0" if args.public else "127.0.0.1"
 SERVER_PORT = args.port
-TRANSFER_BLOCK_SIZE = 0x100000  # 1 MiB
+ROLLING_WINDOW_SIZE = 0x100000  # 1 MiB
 
 
 def check_path_inside_directory(untrusted_relative_path, trusted_directory):
@@ -106,7 +106,7 @@ class SyncRequestHandler(BaseHTTPRequestHandler):
             if os.path.exists(normalized_path):
                 with open(normalized_path, "rb") as f:
                     while True:
-                        buffer = read_file_bytes(f, TRANSFER_BLOCK_SIZE)
+                        buffer = read_file_bytes(f, ROLLING_WINDOW_SIZE)
                         if not buffer:
                             break
                         a, b = sum(buffer), sum((len(buffer) - i) * d for i, d in enumerate(buffer))
@@ -124,45 +124,46 @@ class SyncRequestHandler(BaseHTTPRequestHandler):
             print("creating directory:", normalized_path)
             makedirs_force(normalized_path)
             self.respond_json(dict(status="success"))
-        elif self.path.startswith("/create_file/"):
-            normalized_path = check_path_inside_directory(urllib.parse.unquote(self.path[len("/create_file/"):]), SYNC_TARGET_DIRECTORY)
-            print("creating file:", normalized_path)
+        elif self.path.startswith("/create_or_append_file/"):
+            normalized_path = check_path_inside_directory(urllib.parse.unquote(self.path[len("/create_or_append_file/"):]), SYNC_TARGET_DIRECTORY)
+            print("creating or appending to file:", normalized_path)
             if os.path.isdir(normalized_path):  # if this is a directory, delete it first
                 shutil.rmtree(normalized_path)
-            content_length = int(self.headers['content-length'])
-            modified_time, file_contents = read_file_bytes(self.rfile, content_length).split(b"\n", maxsplit=1)
-            modified_time = int(modified_time, 10)
-            with open(normalized_path, "wb") as f:
+            file_contents = read_file_bytes(self.rfile, int(self.headers['content-length']))
+            with open(normalized_path, "ab") as f:
                 f.write(file_contents)
-            os.utime(normalized_path, ns=(modified_time, modified_time))
             self.respond_json(dict(status="success"))
-        elif self.path.startswith("/patch_file/"):
-            normalized_path = check_path_inside_directory(urllib.parse.unquote(self.path[len("/patch_file/"):]), SYNC_TARGET_DIRECTORY)
-            print("patching file:", normalized_path)
-            content_length = int(self.headers['content-length'])
-            modified_time, file_patch = read_file_bytes(self.rfile, content_length).split(b"\n", maxsplit=1)
-            modified_time = int(modified_time, 10)
-
-            # find an unused path where we can create the new version of the file
-            suffix = 0
-            patched_file_path = f"{normalized_path}.tmp.{suffix}"
-            while os.path.exists(patched_file_path):
-                suffix += 1
-                patched_file_path = f"{normalized_path}.tmp.{suffix}"
+        elif self.path.startswith("/create_or_append_patch/"):
+            patched_file_suffix, target_path = self.path[len("/create_or_append_patch/"):].split("/", maxsplit=1)
+            normalized_path = check_path_inside_directory(urllib.parse.unquote(target_path), SYNC_TARGET_DIRECTORY)
+            print("creating or appending patched file:", normalized_path + patched_file_suffix)
+            file_patch = read_file_bytes(self.rfile, int(self.headers['content-length']))
 
             # generate the new file and overwrite the old file once done
-            with open(normalized_path, "rb") as old_f, open(patched_file_path, "wb") as new_f:
-                current_position = 0
-                while current_position < len(file_patch):
-                    block_number_or_data_size = struct.unpack("<q", file_patch[current_position:current_position + 8])[0]
-                    current_position += 8
+            with open(normalized_path, "rb") as old_f, open(normalized_path + patched_file_suffix, "ab") as new_f:
+                patch_position = 0
+                while patch_position < len(file_patch):
+                    block_number_or_data_size = struct.unpack("<q", file_patch[patch_position:patch_position + 8])[0]
+                    patch_position += 8
                     if block_number_or_data_size <= 0:  # block number, read that block from our version of the file and write it
-                        old_f.seek(abs(block_number_or_data_size) * TRANSFER_BLOCK_SIZE)
-                        new_f.write(read_file_bytes(old_f, TRANSFER_BLOCK_SIZE))
+                        old_f.seek(abs(block_number_or_data_size) * ROLLING_WINDOW_SIZE)
+                        new_f.write(read_file_bytes(old_f, ROLLING_WINDOW_SIZE))
                     else:  # raw data, write it
-                        new_f.write(file_patch[current_position:current_position + block_number_or_data_size])
-                        current_position += block_number_or_data_size
-            os.rename(patched_file_path, normalized_path)
+                        new_f.write(file_patch[patch_position:patch_position + block_number_or_data_size])
+                        patch_position += block_number_or_data_size
+            self.respond_json(dict(status="success"))
+        elif self.path.startswith("/finish_patch/"):
+            patched_file_suffix, target_path = self.path[len("/finish_patch/"):].split("/", maxsplit=1)
+            normalized_path = check_path_inside_directory(urllib.parse.unquote(target_path), SYNC_TARGET_DIRECTORY)
+            print("completing patched file:", normalized_path)
+            modified_time = int(read_file_bytes(self.rfile, int(self.headers['content-length'])), 10)
+            os.rename(normalized_path + patched_file_suffix, normalized_path)
+            os.utime(normalized_path, ns=(modified_time, modified_time))
+            self.respond_json(dict(status="success"))
+        elif self.path.startswith("/update_file_mtime/"):
+            normalized_path = check_path_inside_directory(urllib.parse.unquote(self.path[len("/update_file_mtime/"):]), SYNC_TARGET_DIRECTORY)
+            print("updating file mtime:", normalized_path)
+            modified_time = int(read_file_bytes(self.rfile, int(self.headers['content-length'])), 10)
             os.utime(normalized_path, ns=(modified_time, modified_time))
             self.respond_json(dict(status="success"))
         elif self.path.startswith("/delete_file_or_directory/"):

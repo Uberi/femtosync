@@ -23,7 +23,8 @@ else:
     SYNC_SOURCE_DIRECTORY = args.files_dir
 
 SERVER_HOST_AND_PORT = f"{args.host}:{args.port}"
-TRANSFER_BLOCK_SIZE = 0x100000  # 1 MiB
+ROLLING_WINDOW_SIZE = 0x100000  # 1 MiB, the size of the rsync rolling checksum window
+MAX_CHUNK_SIZE = 0x1000000  # 16 MiB, the maximum size of a request body sent over the network (also determines maximum memory usage at the receiver)
 
 
 def api_call(endpoint_path, post_data=None):
@@ -47,7 +48,11 @@ def recursive_diff(source_path, destination_tree, original_source_path, file_ide
                 if not isinstance(destination_tree.get(entry.name), list):  # this file doesn't match a file with the same name at the destination
                     yield ('create_file', os.path.relpath(entry.path, start=original_source_path))
                 elif file_identifier_func(entry) != destination_tree[entry.name]:  # this file doesn't match the file with the same name at the destination
-                    yield ('patch_file', os.path.relpath(entry.path, start=original_source_path))
+                    path = os.path.relpath(entry.path, start=original_source_path)
+                    i = 0
+                    while f"{path}.tmp.{i}" in destination_tree:  # find an unused path where we can create the patched version of the file
+                        i += 1
+                    yield ('patch_file', (path, f".tmp.{i}"))
     for entry_name in leftover_destination_entries:  # extraneous files that should be removed from the destination
         yield ('delete', os.path.relpath(os.path.join(source_path, entry_name), start=original_source_path))
 
@@ -70,7 +75,7 @@ def generate_file_patch(source_file, destination_block_checksums):
         destination_rollable_checksums_map[checksum].append(i)
 
     # initialize the rolling window and rolling checksum
-    source_rolling_window = collections.deque(read_file_bytes(source_file, TRANSFER_BLOCK_SIZE))
+    source_rolling_window = collections.deque(read_file_bytes(source_file, ROLLING_WINDOW_SIZE))
     source_rolling_checksum_a, source_rolling_checksum_b = sum(source_rolling_window), sum((len(source_rolling_window) - i) * d for i, d in enumerate(source_rolling_window))
     source_rolling_checksum = (source_rolling_checksum_b << 16) | source_rolling_checksum_a
 
@@ -95,7 +100,7 @@ def generate_file_patch(source_file, destination_block_checksums):
 
             # re-initialize the rolling window and rolling checksum to right after the matched block
             source_rolling_window.clear()
-            source_rolling_window.extend(read_file_bytes(source_file, TRANSFER_BLOCK_SIZE))
+            source_rolling_window.extend(read_file_bytes(source_file, ROLLING_WINDOW_SIZE))
             source_rolling_checksum_a, source_rolling_checksum_b = sum(source_rolling_window), sum((len(source_rolling_window) - i) * d for i, d in enumerate(source_rolling_window))
             source_rolling_checksum = (source_rolling_checksum_b << 16) | source_rolling_checksum_a
         else:  # no match found, move to the next byte
@@ -114,11 +119,34 @@ def generate_file_patch(source_file, destination_block_checksums):
 
             # roll the window forward by one byte, calculate the new rolling checksum, add the old byte to the current literal data buffer
             source_rolling_checksum_a -= old_byte - new_byte
-            source_rolling_checksum_b -= old_byte * TRANSFER_BLOCK_SIZE - source_rolling_checksum_a
+            source_rolling_checksum_b -= old_byte * ROLLING_WINDOW_SIZE - source_rolling_checksum_a
             source_rolling_checksum = (source_rolling_checksum_b << 16) | source_rolling_checksum_a
             literal_data_buffer.append(old_byte)
     if literal_data_buffer:
         yield bytes(literal_data_buffer)  # flush the literal data buffer
+
+
+def chunk_file_patch(file_patch, max_chunk_size):
+    current_chunk = bytearray()
+    for block_number_or_data in file_patch:
+        if isinstance(block_number_or_data, int):  # block number
+            if max_chunk_size - len(current_chunk) < 8:  # not enough room left for the block number, flush the current chunk
+                yield bytes(current_chunk)
+                current_chunk.clear()
+            current_chunk += struct.pack("<q", -block_number_or_data)
+        else:  # literal data buffer
+            position = 0
+            while True:  # break up the literal data buffer so that it fits into the chunks
+                if max_chunk_size - len(current_chunk) < 8 + 1:  # not enough room left for another literal data buffer slice, flush the current chunk
+                    yield bytes(current_chunk)
+                    current_chunk.clear()
+                data_slice = block_number_or_data[position:position + (max_chunk_size - len(current_chunk) - 8)]
+                if not data_slice:
+                    break
+                current_chunk += struct.pack("<q", len(data_slice)) + data_slice
+                position += len(data_slice)
+    if current_chunk:
+        yield bytes(current_chunk)
 
 
 def size_and_mtime_identifier(entry: os.DirEntry):
@@ -133,7 +161,6 @@ def checksum_identifier(entry: os.DirEntry):
 
 if args.ios_select_directory:
     api_call(f"/ios_select_directory", b"")
-
 
 if args.checksum:
     file_identifier_func = checksum_identifier
@@ -169,16 +196,20 @@ for i, path in enumerate(create_file_paths):
     modified_time = os.stat(source_path).st_mtime_ns
     if not args.dry_run:
         with open(source_path, "rb") as f:
-            api_call(f"/create_file/{urllib.parse.quote(path)}", str(modified_time).encode("ascii") + b"\n" + f.read())
-for i, path in enumerate(patch_file_paths):
+            while True:
+                buffer = f.read(MAX_CHUNK_SIZE)
+                if not buffer:
+                    break
+                print(f'-> uploading {len(buffer)} byte chunk...')
+                api_call(f"/create_or_append_file/{urllib.parse.quote(path)}", buffer)
+        api_call(f"/update_file_mtime/{urllib.parse.quote(path)}", str(modified_time).encode("ascii"))
+for i, (path, suffix) in enumerate(patch_file_paths):
     print(f'patching file {i + 1} of {len(patch_file_paths)}:', path)
     source_path = os.path.join(SYNC_SOURCE_DIRECTORY, path)
     modified_time = os.stat(source_path).st_mtime_ns
     if not args.dry_run:
         destination_block_checksums = api_call(f"/block_checksums/{urllib.parse.quote(path)}")
         with open(source_path, "rb") as f:
-            file_patch = b"".join(
-                struct.pack("<q", -block_number_or_data) if isinstance(block_number_or_data, int) else struct.pack("<q", len(block_number_or_data)) + block_number_or_data
-                for block_number_or_data in generate_file_patch(f, destination_block_checksums)
-            )
-            api_call(f"/patch_file/{urllib.parse.quote(path)}", str(modified_time).encode("ascii") + b"\n" + file_patch)
+            for file_patch_chunk in chunk_file_patch(generate_file_patch(f, destination_block_checksums), MAX_CHUNK_SIZE):
+                api_call(f"/create_or_append_patch/{suffix}/{urllib.parse.quote(path)}", file_patch_chunk)
+        api_call(f"/finish_patch/{suffix}/{urllib.parse.quote(path)}", str(modified_time).encode("ascii"))
