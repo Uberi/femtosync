@@ -7,21 +7,19 @@ import hashlib
 import struct
 import argparse
 import collections
+import uuid
+import traceback
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--host", help="host that the server is listening on", default="127.0.0.1")
 parser.add_argument("--port", help="network port that the server is listening on", type=int, default=5000)
-parser.add_argument("--files-dir", help="directory to upload/download files from (prefix with @ to specify that the path is relative to the Femtosync executable)", default=".")
 parser.add_argument("--checksum", help="if this flag is specified, file comparison will be performed using full checksumming rather than just comparing size and last-modified-time", action="store_true")
 parser.add_argument("--dry-run", help="just print out what actions would be performed, without actually performing them", action="store_true")
 parser.add_argument("--ios-select-directory", help="if the receiver is running in the Pyto app on iOS, trigger an iOS prompt to select the upload/download directory (this allows the server to sync files in other apps' containers on iOS, e.g. Flacbox music)", action="store_true")
+parser.add_argument("source", help="the file or directory to upload from", default=".")
 args = parser.parse_args()
 
-if args.files_dir.startswith("@"):
-    SYNC_SOURCE_DIRECTORY = os.path.join(os.path.dirname(os.path.realpath(__file__)), args.files_dir[1:])
-else:
-    SYNC_SOURCE_DIRECTORY = args.files_dir
-
+SYNC_SOURCE = args.source
 SERVER_HOST_AND_PORT = f"{args.host}:{args.port}"
 ROLLING_WINDOW_SIZE = 0x100000  # 1 MiB, the size of the rsync rolling checksum window
 MAX_CHUNK_SIZE = 0x1000000  # 16 MiB, the maximum size of a request body sent over the network (also determines maximum memory usage at the receiver)
@@ -35,26 +33,28 @@ def api_call(endpoint_path, post_data=None):
 
 
 def recursive_diff(source_path, destination_tree, original_source_path, file_identifier_func):
-    leftover_destination_entries = set(destination_tree.keys())
-    with os.scandir(source_path) as it:
-        for entry in it:
-            if entry.name in leftover_destination_entries:
-                leftover_destination_entries.remove(entry.name)
-            if entry.is_dir():  # visit subdirectory next
-                if not isinstance(destination_tree.get(entry.name), dict):  # this directory doesn't match a directory with the same name at the destination
-                    yield ('create_directory', os.path.relpath(entry.path, start=original_source_path))
-                yield from recursive_diff(entry.path, destination_tree.get(entry.name, {}), original_source_path, file_identifier_func)
-            else:  # process this file
-                if not isinstance(destination_tree.get(entry.name), list):  # this file doesn't match a file with the same name at the destination
-                    yield ('create_file', os.path.relpath(entry.path, start=original_source_path))
-                elif file_identifier_func(entry) != destination_tree[entry.name]:  # this file doesn't match the file with the same name at the destination
-                    path = os.path.relpath(entry.path, start=original_source_path)
-                    i = 0
-                    while f"{path}.tmp.{i}" in destination_tree:  # find an unused path where we can create the patched version of the file
-                        i += 1
-                    yield ('patch_file', (path, f".tmp.{i}"))
-    for entry_name in leftover_destination_entries:  # extraneous files that should be removed from the destination
-        yield ('delete', os.path.relpath(os.path.join(source_path, entry_name), start=original_source_path))
+    relative_path = os.path.relpath(source_path, start=original_source_path)  # same on both the source and the destination
+    if os.path.isdir(source_path):
+        with os.scandir(source_path) as it:
+            if isinstance(destination_tree, dict):  # directory at source, directory at destination - sync source items to target and delete leftover target items
+                leftover_destination_entries = set(destination_tree.keys())
+                for entry in it:
+                    leftover_destination_entries.discard(entry.name)
+                    yield from recursive_diff(entry.path, destination_tree.get(entry.name), original_source_path, file_identifier_func)
+                for entry_name in leftover_destination_entries:  # extraneous files that should be removed from the destination
+                    yield ('delete', os.path.join(relative_path, entry_name))
+            else:  # directory at source, file or nothing at destination - sync source items to target
+                yield ('create_directory', relative_path)
+                for entry in it:
+                    yield from recursive_diff(entry.path, None, original_source_path, file_identifier_func)
+    else:
+        if destination_tree is None:  # file at source, nothing at destination, create the file
+            yield ('create_file', relative_path)
+        elif isinstance(destination_tree, dict):  # file at source, directory at destination, delete the directory and create the file
+            yield ('delete', relative_path)
+            yield ('create_file', relative_path)
+        elif file_identifier_func(source_path) != destination_tree:  # file at source, differing file at destination - patch the file
+            yield ('patch_file', relative_path)
 
 
 def read_file_bytes(f, size):
@@ -149,28 +149,22 @@ def chunk_file_patch(file_patch, max_chunk_size):
         yield bytes(current_chunk)
 
 
-def size_and_mtime_identifier(entry: os.DirEntry):
-    stat_result = entry.stat()
-    return [entry.name, stat_result.st_size, stat_result.st_mtime_ns]
-
-
-def checksum_identifier(entry: os.DirEntry):
-    with open(entry.path, "rb") as f:
-        return [entry.name, hashlib.sha256(f.read()).hexdigest()]
-
-
 if args.ios_select_directory:
     api_call(f"/ios_select_directory", b"")
 
 if args.checksum:
-    file_identifier_func = checksum_identifier
+    def file_identifier_func(path):
+        with open(path, "rb") as f:
+            return [os.path.basename(path), hashlib.sha256(f.read()).hexdigest()]
     destination_tree = api_call("/directory_tree_checksum")
 else:
-    file_identifier_func = size_and_mtime_identifier
+    def file_identifier_func(path):
+        stat_result = os.stat(path)
+        return [os.path.basename(path), stat_result.st_size, stat_result.st_mtime_ns]
     destination_tree = api_call("/directory_tree_size_and_mtime")
 
 create_directory_paths, create_file_paths, patch_file_paths, delete_paths = [], [], [], []
-for action, path in recursive_diff(SYNC_SOURCE_DIRECTORY, destination_tree, SYNC_SOURCE_DIRECTORY, file_identifier_func):
+for action, path in recursive_diff(SYNC_SOURCE, destination_tree, SYNC_SOURCE, file_identifier_func):
     if action == "create_directory":
         create_directory_paths.append(path)
     elif action == "create_file":
@@ -185,31 +179,41 @@ for action, path in recursive_diff(SYNC_SOURCE_DIRECTORY, destination_tree, SYNC
 for i, path in enumerate(delete_paths):
     print(f'deleting {i + 1} of {len(delete_paths)}:', path)
     if not args.dry_run:
-        api_call(f"/delete_file_or_directory/{urllib.parse.quote(path)}", b"")
+        try:
+            api_call(f"/delete_file_or_directory/{urllib.parse.quote(path)}", b"")
+        except Exception as e:
+            traceback.print_exc()
 for i, path in enumerate(create_directory_paths):
     print(f'creating directory {i + 1} of {len(create_directory_paths)}:', path)
     if not args.dry_run:
         api_call(f"/create_directory/{urllib.parse.quote(path)}", b"")
 for i, path in enumerate(create_file_paths):
     print(f'creating file {i + 1} of {len(create_file_paths)}:', path)
-    source_path = os.path.join(SYNC_SOURCE_DIRECTORY, path)
+    source_path = os.path.normpath(os.path.join(SYNC_SOURCE, path))
     modified_time = os.stat(source_path).st_mtime_ns
     if not args.dry_run:
-        with open(source_path, "rb") as f:
-            while True:
-                buffer = f.read(MAX_CHUNK_SIZE)
-                if not buffer:
-                    break
-                print(f'-> uploading {len(buffer)} byte chunk...')
-                api_call(f"/create_or_append_file/{urllib.parse.quote(path)}", buffer)
-        api_call(f"/update_file_mtime/{urllib.parse.quote(path)}", str(modified_time).encode("ascii"))
-for i, (path, suffix) in enumerate(patch_file_paths):
+        try:
+            with open(source_path, "rb") as f:
+                while True:
+                    buffer = read_file_bytes(f, MAX_CHUNK_SIZE)
+                    if not buffer:
+                        break
+                    print(f'-> uploading {len(buffer)} byte chunk...')
+                    api_call(f"/create_or_append_file/{urllib.parse.quote(path)}", buffer)
+            api_call(f"/finish_create_file/{urllib.parse.quote(path)}", str(modified_time).encode("ascii"))
+        except Exception as e:
+            traceback.print_exc()
+for i, path in enumerate(patch_file_paths):
     print(f'patching file {i + 1} of {len(patch_file_paths)}:', path)
-    source_path = os.path.join(SYNC_SOURCE_DIRECTORY, path)
+    source_path = os.path.normpath(os.path.join(SYNC_SOURCE, path))
     modified_time = os.stat(source_path).st_mtime_ns
+    target_patch_file = ".femtosync-tmp-" + str(uuid.uuid4())  # random file that's nearly guaranteed not to already exist
     if not args.dry_run:
-        destination_block_checksums = api_call(f"/block_checksums/{urllib.parse.quote(path)}")
-        with open(source_path, "rb") as f:
-            for file_patch_chunk in chunk_file_patch(generate_file_patch(f, destination_block_checksums), MAX_CHUNK_SIZE):
-                api_call(f"/create_or_append_patch/{suffix}/{urllib.parse.quote(path)}", file_patch_chunk)
-        api_call(f"/finish_patch/{suffix}/{urllib.parse.quote(path)}", str(modified_time).encode("ascii"))
+        try:
+            destination_block_checksums = api_call(f"/block_checksums/{urllib.parse.quote(path)}")
+            with open(source_path, "rb") as f:
+                for file_patch_chunk in chunk_file_patch(generate_file_patch(f, destination_block_checksums), MAX_CHUNK_SIZE):
+                    api_call(f"/create_or_append_patch/{target_patch_file}/{urllib.parse.quote(path)}", file_patch_chunk)
+            api_call(f"/finish_patch/{target_patch_file}/{urllib.parse.quote(path)}", str(modified_time).encode("ascii"))
+        except Exception as e:
+            traceback.print_exc()

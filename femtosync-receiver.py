@@ -12,54 +12,38 @@ import argparse
 parser = argparse.ArgumentParser()
 parser.add_argument("--port", help="local network port to listen on", type=int, default=5000)
 parser.add_argument("--public", help="listen on remote network interfaces (allows other hosts to see the website; otherwise only this host can see it)", action="store_true")
-parser.add_argument("--files-dir", help="directory to upload/download files from (prefix with @ to specify that the path is relative to the Femtosync executable)", default=".")
+parser.add_argument("target", help="the file or directory to download to", default=".")
 args = parser.parse_args()
 
-# note that in the Pyto app on iOS, this setting can be dynamically changed by making a POST request to /ios_set_target_directory
-if args.files_dir.startswith("@"):
-    SYNC_TARGET_DIRECTORY = os.path.join(os.path.dirname(os.path.realpath(__file__)), args.files_dir[1:])
-else:
-    SYNC_TARGET_DIRECTORY = args.files_dir
-
+SYNC_TARGET = args.target  # note that in the Pyto app on iOS, this setting can be dynamically changed by making a POST request to /ios_set_target_directory
 SERVER_HOST = "0.0.0.0" if args.public else "127.0.0.1"
 SERVER_PORT = args.port
 ROLLING_WINDOW_SIZE = 0x100000  # 1 MiB
 
 
-def check_path_inside_directory(untrusted_relative_path, trusted_directory):
-    normalized_directory = os.path.abspath(trusted_directory)
-    normalized_path = os.path.normpath(os.path.join(normalized_directory, untrusted_relative_path))
-    assert os.path.commonpath([normalized_path, normalized_directory]) == normalized_directory, "Untrusted relative path must be inside trusted directory"
+def validate_path_is_trustworthy(untrusted_relative_path, trusted_directory_or_file):
+    normalized_directory_or_file = os.path.abspath(trusted_directory_or_file)
+    normalized_path = os.path.normpath(os.path.join(normalized_directory_or_file, untrusted_relative_path))
+    assert os.path.commonpath([normalized_path, normalized_directory_or_file]) == normalized_directory_or_file, "Untrusted relative path must be inside trusted directory or equal to trusted file"
     return normalized_path
 
 
 def recursive_list(current_path, file_identifier_func):
-    result = {}
-    with os.scandir(current_path) as it:
-        for entry in it:
-            if entry.is_dir():  # visit subdirectory next
-                result[entry.name] = recursive_list(entry.path, file_identifier_func)
-            else:  # process this file
-                result[entry.name] = file_identifier_func(entry)
-    return result
+    if os.path.isdir(current_path):
+        with os.scandir(current_path) as it:
+            return {entry.name: recursive_list(entry.path, file_identifier_func) for entry in it}
+    else:
+        return file_identifier_func(current_path)
 
 
-def makedirs_force(name, mode=0o777):
+def makedirs_force(path, mode=0o777):
     """Like os.makedirs but will also delete files that conflict with any parts of this path along the way."""
-    head, tail = os.path.split(name)
-    if not tail:
-        head, tail = os.path.split(head)
-    if head and tail and not os.path.isdir(head):
-        if os.path.exists(head):  # head is a file, remove it to make way for this directory
-            os.remove(head)
-        makedirs_force(head, mode)
-        if tail == curdir:  # directory exists, we're done
-            return
-    try:
-        os.mkdir(name, mode)
-    except OSError:
-        if not os.path.isdir(name):  # we didn't end up actually creating the directory
-            raise
+    if os.path.isfile(path):
+        os.remove(path)
+    if not os.path.exists(path):
+        if path != os.path.dirname(path):  # not already at top-level directory
+            makedirs_force(os.path.dirname(path), mode)
+        os.mkdir(path, mode)
 
 
 def read_file_bytes(f, size):
@@ -83,25 +67,25 @@ def handle_post_ios_select_directory():
     # shows directory selection modal on iOS, then
     # gives us the necessary permissions to actually read from or write to the selected directory, then
     # returns the selected directory as a path string
-    global SYNC_TARGET_DIRECTORY
-    SYNC_TARGET_DIRECTORY = file_system.pick_directory()
+    global SYNC_TARGET
+    SYNC_TARGET = file_system.pick_directory()
     return dict(status="success")
 
 
 class SyncRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/directory_tree_size_and_mtime":
-            def size_and_mtime_identifier(entry: os.DirEntry):
-                stat_result = entry.stat()
-                return [entry.name, stat_result.st_size, stat_result.st_mtime_ns]
-            self.respond_json(dict(status="success", result=recursive_list(SYNC_TARGET_DIRECTORY, size_and_mtime_identifier)))
+            def size_and_mtime_identifier(path):
+                stat_result = os.stat(path)
+                return [os.path.basename(path), stat_result.st_size, stat_result.st_mtime_ns]
+            self.respond_json(dict(status="success", result=recursive_list(SYNC_TARGET, size_and_mtime_identifier)))
         if self.path == "/directory_tree_checksum":
-            def checksum_identifier(entry: os.DirEntry):
-                with open(entry.path, "rb") as f:
-                    return [entry.name, hashlib.sha256(f.read()).hexdigest()]
-            self.respond_json(dict(status="success", result=recursive_list(SYNC_TARGET_DIRECTORY, checksum_identifier)))
+            def checksum_identifier(path):
+                with open(path, "rb") as f:
+                    return [os.path.basename(path), hashlib.sha256(f.read()).hexdigest()]
+            self.respond_json(dict(status="success", result=recursive_list(SYNC_TARGET, checksum_identifier)))
         elif self.path.startswith("/block_checksums/"):
-            normalized_path = check_path_inside_directory(urllib.parse.unquote(self.path[len("/block_checksums/"):]), SYNC_TARGET_DIRECTORY)
+            normalized_path = validate_path_is_trustworthy(urllib.parse.unquote(self.path[len("/block_checksums/"):]), SYNC_TARGET)
             rollable_checksums, collision_resistant_checksums = [], []
             if os.path.exists(normalized_path):
                 with open(normalized_path, "rb") as f:
@@ -120,12 +104,12 @@ class SyncRequestHandler(BaseHTTPRequestHandler):
         if self.path == "/ios_select_directory":
             self.respond_json(handle_post_ios_select_directory())
         elif self.path.startswith("/create_directory/"):
-            normalized_path = check_path_inside_directory(urllib.parse.unquote(self.path[len("/create_directory/"):]), SYNC_TARGET_DIRECTORY)
+            normalized_path = validate_path_is_trustworthy(urllib.parse.unquote(self.path[len("/create_directory/"):]), SYNC_TARGET)
             print("creating directory:", normalized_path)
             makedirs_force(normalized_path)
             self.respond_json(dict(status="success"))
         elif self.path.startswith("/create_or_append_file/"):
-            normalized_path = check_path_inside_directory(urllib.parse.unquote(self.path[len("/create_or_append_file/"):]), SYNC_TARGET_DIRECTORY)
+            normalized_path = validate_path_is_trustworthy(urllib.parse.unquote(self.path[len("/create_or_append_file/"):]), SYNC_TARGET)
             print("creating or appending to file:", normalized_path)
             if os.path.isdir(normalized_path):  # if this is a directory, delete it first
                 shutil.rmtree(normalized_path)
@@ -133,14 +117,21 @@ class SyncRequestHandler(BaseHTTPRequestHandler):
             with open(normalized_path, "ab") as f:
                 f.write(file_contents)
             self.respond_json(dict(status="success"))
+        elif self.path.startswith("/finish_create_file/"):
+            normalized_path = validate_path_is_trustworthy(urllib.parse.unquote(self.path[len("/finish_create_file/"):]), SYNC_TARGET)
+            print("updating file mtime:", normalized_path)
+            modified_time = int(read_file_bytes(self.rfile, int(self.headers['content-length'])), 10)
+            os.utime(normalized_path, ns=(modified_time, modified_time))
+            self.respond_json(dict(status="success"))
         elif self.path.startswith("/create_or_append_patch/"):
-            patched_file_suffix, target_path = self.path[len("/create_or_append_patch/"):].split("/", maxsplit=1)
-            normalized_path = check_path_inside_directory(urllib.parse.unquote(target_path), SYNC_TARGET_DIRECTORY)
-            print("creating or appending patched file:", normalized_path + patched_file_suffix)
+            target_patch_file, target_path = self.path[len("/create_or_append_patch/"):].split("/", maxsplit=1)
+            normalized_path = validate_path_is_trustworthy(urllib.parse.unquote(target_path), SYNC_TARGET)
+            target_patch_path = os.path.join(os.path.dirname(normalized_path), os.path.basename(target_patch_file))
+            print("creating or appending patched file:", normalized_path, target_patch_path)
             file_patch = read_file_bytes(self.rfile, int(self.headers['content-length']))
 
             # generate the new file and overwrite the old file once done
-            with open(normalized_path, "rb") as old_f, open(normalized_path + patched_file_suffix, "ab") as new_f:
+            with open(normalized_path, "rb") as old_f, open(target_patch_path, "ab") as new_f:
                 patch_position = 0
                 while patch_position < len(file_patch):
                     block_number_or_data_size = struct.unpack("<q", file_patch[patch_position:patch_position + 8])[0]
@@ -153,21 +144,16 @@ class SyncRequestHandler(BaseHTTPRequestHandler):
                         patch_position += block_number_or_data_size
             self.respond_json(dict(status="success"))
         elif self.path.startswith("/finish_patch/"):
-            patched_file_suffix, target_path = self.path[len("/finish_patch/"):].split("/", maxsplit=1)
-            normalized_path = check_path_inside_directory(urllib.parse.unquote(target_path), SYNC_TARGET_DIRECTORY)
-            print("completing patched file:", normalized_path)
+            target_patch_file, target_path = self.path[len("/finish_patch/"):].split("/", maxsplit=1)
+            normalized_path = validate_path_is_trustworthy(urllib.parse.unquote(target_path), SYNC_TARGET)
+            target_patch_path = os.path.join(os.path.dirname(normalized_path), os.path.basename(target_patch_file))
+            print("completing patched file:", normalized_path, target_patch_path)
             modified_time = int(read_file_bytes(self.rfile, int(self.headers['content-length'])), 10)
-            os.rename(normalized_path + patched_file_suffix, normalized_path)
-            os.utime(normalized_path, ns=(modified_time, modified_time))
-            self.respond_json(dict(status="success"))
-        elif self.path.startswith("/update_file_mtime/"):
-            normalized_path = check_path_inside_directory(urllib.parse.unquote(self.path[len("/update_file_mtime/"):]), SYNC_TARGET_DIRECTORY)
-            print("updating file mtime:", normalized_path)
-            modified_time = int(read_file_bytes(self.rfile, int(self.headers['content-length'])), 10)
+            os.rename(target_patch_path, normalized_path)
             os.utime(normalized_path, ns=(modified_time, modified_time))
             self.respond_json(dict(status="success"))
         elif self.path.startswith("/delete_file_or_directory/"):
-            normalized_path = check_path_inside_directory(urllib.parse.unquote(self.path[len("/delete_file_or_directory/"):]), SYNC_TARGET_DIRECTORY)
+            normalized_path = validate_path_is_trustworthy(urllib.parse.unquote(self.path[len("/delete_file_or_directory/"):]), SYNC_TARGET)
             print("deleting:", normalized_path)
             try:
                 os.remove(normalized_path)
@@ -190,15 +176,20 @@ def get_local_ip_address():
     import socket
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        s.connect(('8.8.8.8', 1))  # connect() on a UDP socket doesn't actually send any packets, so the IP address doesn't actually have to be reachable at all
+        # connect() on a UDP socket doesn't actually send any packets, so the IP address doesn't actually have to be reachable at all
+        # however, note that this can fail if the computer isn't connected to any networks, because in that case we simply don't have a local IP address
+        s.connect(('8.8.8.8', 1))
         return s.getsockname()[0]
+    except OSError:
+        return None
     finally:
         s.close()
 
 
 if __name__ == '__main__':
     print(f"Starting server listening at {SERVER_HOST}:{SERVER_PORT}")
-    print(f"On the sending computer, run this command: femtosync-sender.py --host {get_local_ip_address()} --port {SERVER_PORT} --files-dir SOME_SYNC_SOURCE_DIRECTORY")
+    local_ip_address = get_local_ip_address()
+    print(f"On the sending computer, run this command: ./femtosync-sender.py --host {'INSERT_LOCAL_IP_ADDRESS_HERE' if local_ip_address is None else local_ip_address} --port {SERVER_PORT} INSERT_SYNC_SOURCE_FILE_OR_DIRECTORY")
 
     server = HTTPServer((SERVER_HOST, SERVER_PORT), SyncRequestHandler)
     try:
